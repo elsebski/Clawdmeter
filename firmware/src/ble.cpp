@@ -260,6 +260,17 @@ void ble_send_nack(void) {
     }
 }
 
+void ble_send_decision(const char* id, const char* decision) {
+    if (state != BLE_STATE_CONNECTED || !tx_char) return;
+    char buf[128];
+    snprintf(buf, sizeof(buf),
+        "{\"cmd\":\"permission\",\"id\":\"%s\",\"decision\":\"%s\"}",
+        id ? id : "", decision ? decision : "deny");
+    tx_char->setValue(buf);
+    tx_char->notify();
+    Serial.printf("BLE: decision sent: %s\n", buf);
+}
+
 void ble_request_refresh(void) {
     if (state == BLE_STATE_CONNECTED && req_char) {
         uint8_t v = 0x01;

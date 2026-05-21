@@ -118,6 +118,16 @@ static lv_obj_t* lbl_ble_status;
 static lv_obj_t* lbl_ble_device;
 static lv_obj_t* lbl_ble_mac;
 
+// ---- Permission screen widgets ----
+static lv_obj_t* perm_container;
+static lv_obj_t* lbl_perm_tool;
+static lv_obj_t* lbl_perm_hint;
+static lv_obj_t* btn_allow;
+static lv_obj_t* btn_deny;
+
+// ---- Pending-prompt badge (overlay, shown on non-permission screens) ----
+static lv_obj_t* badge_btn;
+
 // ---- Battery indicator (shared, on top) ----
 static lv_obj_t* battery_img;
 static lv_obj_t* logo_img;
@@ -126,6 +136,10 @@ static lv_image_dsc_t battery_dscs[5];  // empty, low, medium, full, charging
 // ---- Shared ----
 static lv_image_dsc_t logo_dsc;
 static screen_t current_screen = SCREEN_USAGE;
+
+// ---- Permission state ----
+static PromptData prompt_state = {};
+static screen_t screen_before_prompt = SCREEN_USAGE;
 
 // Animation state
 static uint32_t anim_last_ms = 0;
@@ -417,6 +431,196 @@ static void init_bluetooth_screen(lv_obj_t* scr) {
     lv_obj_add_flag(ble_container, LV_OBJ_FLAG_HIDDEN);
 }
 
+// ======== Permission Screen ========
+
+static void perm_allow_click_cb(lv_event_t* e) {
+    (void)e;
+    ui_permission_decide("allow");
+}
+
+static void perm_deny_click_cb(lv_event_t* e) {
+    (void)e;
+    ui_permission_decide("deny");
+}
+
+static lv_obj_t* make_decision_button(lv_obj_t* parent, const char* text,
+                                      lv_color_t color, int x, int y, int w, int h,
+                                      lv_event_cb_t cb) {
+    lv_obj_t* btn = lv_obj_create(parent);
+    lv_obj_set_pos(btn, x, y);
+    lv_obj_set_size(btn, w, h);
+    lv_obj_set_style_bg_color(btn, color, 0);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(btn, 12, 0);
+    lv_obj_set_style_border_width(btn, 0, 0);
+    lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* lbl = lv_label_create(btn);
+    lv_label_set_text(lbl, text);
+    lv_obj_set_style_text_font(lbl, &font_styrene_48, 0);
+    lv_obj_set_style_text_color(lbl, COL_TEXT, 0);
+    lv_obj_center(lbl);
+    return btn;
+}
+
+static void init_permission_screen(lv_obj_t* scr) {
+    perm_container = lv_obj_create(scr);
+    lv_obj_set_size(perm_container, L.scr_w, L.scr_h);
+    lv_obj_set_pos(perm_container, 0, 0);
+    lv_obj_set_style_bg_opa(perm_container, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(perm_container, 0, 0);
+    lv_obj_set_style_pad_all(perm_container, 0, 0);
+    lv_obj_clear_flag(perm_container, LV_OBJ_FLAG_SCROLLABLE);
+    // No global_click_cb here — taps on this screen go to Allow/Deny buttons.
+
+    // Title matches the header rhythm used by the Usage / Bluetooth screens:
+    // short word, same font + position, so the logo and battery stay visible
+    // and uncovered. Keeping it brief leaves the centre clear for the long
+    // tool name underneath.
+    lv_obj_t* lbl_perm_title = lv_label_create(perm_container);
+    lv_label_set_text(lbl_perm_title, "Allow?");
+    lv_obj_set_style_text_font(lbl_perm_title, &font_tiempos_56, 0);
+    lv_obj_set_style_text_color(lbl_perm_title, COL_ACCENT, 0);
+    lv_obj_align(lbl_perm_title, LV_ALIGN_TOP_MID, 16, L.title_y);
+
+    // Tool name (big)
+    lbl_perm_tool = lv_label_create(perm_container);
+    lv_label_set_text(lbl_perm_tool, "Tool");
+    lv_obj_set_style_text_font(lbl_perm_tool, &font_styrene_48, 0);
+    lv_obj_set_style_text_color(lbl_perm_tool, COL_TEXT, 0);
+    lv_obj_align(lbl_perm_tool, LV_ALIGN_TOP_MID, 0, L.content_y);
+
+    // Hint (wrapped)
+    int hint_y = L.content_y + 70;
+    int btn_h = 90;
+    int btn_y = L.scr_h - btn_h - L.margin;
+    int hint_h = btn_y - hint_y - 16;
+    lbl_perm_hint = lv_label_create(perm_container);
+    lv_label_set_text(lbl_perm_hint, "");
+    lv_obj_set_style_text_font(lbl_perm_hint, &font_styrene_24, 0);
+    lv_obj_set_style_text_color(lbl_perm_hint, COL_DIM, 0);
+    lv_obj_set_style_text_align(lbl_perm_hint, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_pos(lbl_perm_hint, L.margin, hint_y);
+    lv_obj_set_size(lbl_perm_hint, L.content_w, hint_h);
+    lv_label_set_long_mode(lbl_perm_hint, LV_LABEL_LONG_WRAP);
+
+    // Allow / Deny side-by-side at the bottom
+    int gap = 16;
+    int btn_w = (L.content_w - gap) / 2;
+    btn_allow = make_decision_button(perm_container, "Allow", COL_GREEN,
+                                     L.margin, btn_y, btn_w, btn_h, perm_allow_click_cb);
+    btn_deny  = make_decision_button(perm_container, "Deny", COL_RED,
+                                     L.margin + btn_w + gap, btn_y, btn_w, btn_h, perm_deny_click_cb);
+
+    lv_obj_add_flag(perm_container, LV_OBJ_FLAG_HIDDEN);
+}
+
+// ======== Calibration Screen ========
+
+static lv_obj_t* cal_container;
+static lv_obj_t* cal_status;
+static lv_obj_t* cal_dot;
+static uint8_t  cal_idx = 0;
+
+struct CalTarget { int cx, cy; const char* name; };
+static const CalTarget cal_targets[4] = {
+    {40,  40,  "1: TOP-LEFT"},
+    {440, 40,  "2: TOP-RIGHT"},
+    {440, 440, "3: BOTTOM-RIGHT"},
+    {40,  440, "4: BOTTOM-LEFT"},
+};
+
+static void cal_render(void) {
+    const CalTarget& t = cal_targets[cal_idx];
+    lv_obj_set_pos(cal_dot, t.cx - 20, t.cy - 20);  // dot is 40x40
+    char buf[64];
+    snprintf(buf, sizeof(buf), "Tap dot %s", t.name);
+    lv_label_set_text(cal_status, buf);
+    Serial.printf("CAL target idx=%u name=%s content=(%d,%d)\n",
+        cal_idx, t.name, t.cx, t.cy);
+}
+
+static void cal_click_cb(lv_event_t* e) {
+    (void)e;
+    cal_idx = (cal_idx + 1) % 4;
+    cal_render();
+}
+
+static void init_calibration_screen(lv_obj_t* scr) {
+    cal_container = lv_obj_create(scr);
+    lv_obj_set_size(cal_container, L.scr_w, L.scr_h);
+    lv_obj_set_pos(cal_container, 0, 0);
+    lv_obj_set_style_bg_color(cal_container, COL_BG, 0);
+    lv_obj_set_style_bg_opa(cal_container, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(cal_container, 0, 0);
+    lv_obj_set_style_pad_all(cal_container, 0, 0);
+    lv_obj_clear_flag(cal_container, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(cal_container, cal_click_cb, LV_EVENT_CLICKED, NULL);
+
+    cal_status = lv_label_create(cal_container);
+    lv_label_set_text(cal_status, "Tap dot");
+    lv_obj_set_style_text_font(cal_status, &font_styrene_28, 0);
+    lv_obj_set_style_text_color(cal_status, COL_TEXT, 0);
+    lv_obj_align(cal_status, LV_ALIGN_CENTER, 0, 0);
+
+    cal_dot = lv_obj_create(cal_container);
+    lv_obj_set_size(cal_dot, 40, 40);
+    lv_obj_set_style_bg_color(cal_dot, COL_AMBER, 0);
+    lv_obj_set_style_bg_opa(cal_dot, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(cal_dot, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_border_width(cal_dot, 0, 0);
+    lv_obj_clear_flag(cal_dot, LV_OBJ_FLAG_SCROLLABLE);
+    // Bubble so the screen-level handler picks up the click — we don't care
+    // *where* exactly the user tapped, only that they tapped intending the dot.
+    lv_obj_add_flag(cal_dot, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+    lv_obj_add_flag(cal_container, LV_OBJ_FLAG_HIDDEN);
+}
+
+// ======== Pending-prompt badge ========
+
+static void badge_click_cb(lv_event_t* e) {
+    (void)e;
+    if (prompt_state.active) ui_show_screen(SCREEN_PERMISSION);
+}
+
+static void init_badge(lv_obj_t* scr) {
+    badge_btn = lv_obj_create(scr);
+    int sz = 48;
+    // Sit to the left of the battery icon
+    int x = L.scr_w - 48 - L.margin - sz - 10;
+    int y = L.title_y - 2;
+    lv_obj_set_pos(badge_btn, x, y);
+    lv_obj_set_size(badge_btn, sz, sz);
+    lv_obj_set_style_bg_color(badge_btn, COL_RED, 0);
+    lv_obj_set_style_bg_opa(badge_btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(badge_btn, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_border_width(badge_btn, 3, 0);
+    lv_obj_set_style_border_color(badge_btn, COL_TEXT, 0);
+    lv_obj_set_style_border_opa(badge_btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(badge_btn, 0, 0);
+    lv_obj_clear_flag(badge_btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(badge_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(badge_btn, badge_click_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* lbl = lv_label_create(badge_btn);
+    lv_label_set_text(lbl, "?");
+    lv_obj_set_style_text_font(lbl, &font_styrene_28, 0);
+    lv_obj_set_style_text_color(lbl, COL_TEXT, 0);
+    lv_obj_center(lbl);
+
+    lv_obj_add_flag(badge_btn, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void apply_badge_visibility(void) {
+    if (!badge_btn) return;
+    bool show = prompt_state.active && current_screen != SCREEN_PERMISSION;
+    if (show) lv_obj_clear_flag(badge_btn, LV_OBJ_FLAG_HIDDEN);
+    else      lv_obj_add_flag(badge_btn, LV_OBJ_FLAG_HIDDEN);
+}
+
 // ======== Public API ========
 
 void ui_init(void) {
@@ -431,6 +635,8 @@ void ui_init(void) {
 
     init_usage_screen(scr);
     init_bluetooth_screen(scr);
+    init_permission_screen(scr);
+    init_calibration_screen(scr);
     splash_init(scr);
 
     if (splash_get_root()) {
@@ -444,6 +650,9 @@ void ui_init(void) {
     battery_img = lv_image_create(scr);
     lv_image_set_src(battery_img, &battery_dscs[0]);
     lv_obj_set_pos(battery_img, L.scr_w - 48 - L.margin, L.title_y);
+
+    // Badge created last so it sits on top of everything else.
+    init_badge(scr);
 }
 
 void ui_update(const UsageData* data) {
@@ -464,7 +673,19 @@ void ui_update(const UsageData* data) {
     lv_bar_set_value(bar_weekly, w_pct, LV_ANIM_ON);
     lv_obj_set_style_bg_color(bar_weekly, pct_color(data->weekly_pct), LV_PART_INDICATOR);
 
-    format_reset_time(data->weekly_reset_mins, buf, sizeof(buf));
+    char reset_buf[40];
+    format_reset_time(data->weekly_reset_mins, reset_buf, sizeof(reset_buf));
+    if (data->weekly_reset_mins > 0) {
+        // Pace gauge: if you stay <= this %, you're on track to not exceed
+        // the weekly quota. days_remaining is ceiling of wr / 1440 so a
+        // partial day rounds up (you still own today's slice).
+        int days = (data->weekly_reset_mins + 1439) / 1440;
+        if (days < 1) days = 1;
+        int today_max = 100 / days;
+        snprintf(buf, sizeof(buf), "%s | Today %d%%", reset_buf, today_max);
+    } else {
+        snprintf(buf, sizeof(buf), "%s", reset_buf);
+    }
     lv_label_set_text(lbl_weekly_reset, buf);
 }
 
@@ -501,7 +722,14 @@ static void apply_battery_visibility(void) {
 
 static void global_click_cb(lv_event_t* e) {
     (void)e;
+    // Pending prompt always takes priority — any tap anywhere (except on the
+    // permission screen itself) jumps to it. The badge is just a hint.
+    if (prompt_state.active && current_screen != SCREEN_PERMISSION) {
+        ui_show_screen(SCREEN_PERMISSION);
+        return;
+    }
     if (current_screen == SCREEN_SPLASH) ui_show_screen(prev_non_splash_screen);
+    else if (current_screen == SCREEN_PERMISSION) { /* no-op: handled by buttons */ }
     else                                  ui_show_screen(SCREEN_SPLASH);
 }
 
@@ -513,12 +741,16 @@ static void ble_reset_click_cb(lv_event_t* e) {
 void ui_show_screen(screen_t screen) {
     lv_obj_add_flag(usage_container, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(ble_container, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(perm_container, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(cal_container, LV_OBJ_FLAG_HIDDEN);
     splash_hide();
 
     switch (screen) {
     case SCREEN_SPLASH:     splash_show(); break;
     case SCREEN_USAGE:      lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_HIDDEN); break;
     case SCREEN_BLUETOOTH:  lv_obj_clear_flag(ble_container, LV_OBJ_FLAG_HIDDEN); break;
+    case SCREEN_PERMISSION: lv_obj_clear_flag(perm_container, LV_OBJ_FLAG_HIDDEN); break;
+    case SCREEN_CALIBRATE:  lv_obj_clear_flag(cal_container, LV_OBJ_FLAG_HIDDEN); break;
     default: break;
     }
 
@@ -527,9 +759,15 @@ void ui_show_screen(screen_t screen) {
         else                          lv_obj_clear_flag(logo_img, LV_OBJ_FLAG_HIDDEN);
     }
 
-    if (screen != SCREEN_SPLASH) prev_non_splash_screen = screen;
+    // Remember the screen the user was on before they jumped into a
+    // permission prompt — so we can return to it after the decision.
+    if (screen != SCREEN_SPLASH && screen != SCREEN_PERMISSION) {
+        prev_non_splash_screen = screen;
+        screen_before_prompt = screen;
+    }
     current_screen = screen;
     apply_battery_visibility();
+    apply_badge_visibility();
 }
 
 void ui_cycle_screen(void) {
@@ -581,6 +819,47 @@ void ui_update_ble_status(ble_state_t state, const char* name, const char* mac) 
         snprintf(mbuf, sizeof(mbuf), "Address: %s", mac);
         lv_label_set_text(lbl_ble_mac, mbuf);
     }
+}
+
+void ui_set_prompt(const char* id, const char* tool, const char* hint) {
+    strlcpy(prompt_state.id, id ? id : "", sizeof(prompt_state.id));
+    strlcpy(prompt_state.tool, tool ? tool : "", sizeof(prompt_state.tool));
+    strlcpy(prompt_state.hint, hint ? hint : "", sizeof(prompt_state.hint));
+    prompt_state.active = true;
+
+    if (lbl_perm_tool) lv_label_set_text(lbl_perm_tool, prompt_state.tool);
+    if (lbl_perm_hint) lv_label_set_text(lbl_perm_hint, prompt_state.hint);
+
+    // Remember where the user was so we can return there after the decision.
+    if (current_screen != SCREEN_PERMISSION) screen_before_prompt = current_screen;
+    apply_badge_visibility();
+}
+
+void ui_clear_prompt(void) {
+    prompt_state.active = false;
+    prompt_state.id[0] = '\0';
+    apply_badge_visibility();
+    if (current_screen == SCREEN_PERMISSION) ui_show_screen(screen_before_prompt);
+}
+
+bool ui_has_pending_prompt(void) {
+    return prompt_state.active;
+}
+
+void ui_show_calibration(void) {
+    cal_idx = 0;
+    ui_show_screen(SCREEN_CALIBRATE);
+    cal_render();
+}
+
+void ui_permission_decide(const char* decision) {
+    if (!prompt_state.active) return;
+    ble_send_decision(prompt_state.id, decision);
+    screen_t return_to = screen_before_prompt;
+    prompt_state.active = false;
+    prompt_state.id[0] = '\0';
+    apply_badge_visibility();
+    ui_show_screen(return_to);
 }
 
 void ui_update_battery(int percent, bool charging) {

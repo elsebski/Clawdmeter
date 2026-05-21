@@ -86,8 +86,12 @@ static void my_touch_cb(lv_indev_t* indev, lv_indev_data_t* data) {
     }
 }
 
-// Parse a JSON line into UsageData.
-static bool parse_json(const char* json, UsageData* out) {
+// Handle a JSON line from BLE. Two independent payload kinds may appear in
+// the same message:
+//   - Usage update: keys "s","sr","w","wr","st","ok" (existing daemon).
+//   - Permission prompt: "prompt":{"id","tool","hint"} sets it,
+//     "prompt":null clears it (matches the claude_companion wire shape).
+static bool handle_incoming(const char* json) {
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, json);
     if (err) {
@@ -95,14 +99,55 @@ static bool parse_json(const char* json, UsageData* out) {
         return false;
     }
 
-    out->session_pct = doc["s"] | 0.0f;
-    out->session_reset_mins = doc["sr"] | -1;
-    out->weekly_pct = doc["w"] | 0.0f;
-    out->weekly_reset_mins = doc["wr"] | -1;
-    strlcpy(out->status, doc["st"] | "unknown", sizeof(out->status));
-    out->ok = doc["ok"] | false;
-    out->valid = true;
-    return true;
+    bool ok_any = false;
+
+    // ---- Usage update (only if "s" is present, so prompt-only payloads
+    //      don't zero the usage panel) ----
+    if (doc["s"].is<float>() || doc["s"].is<int>()) {
+        usage.session_pct = doc["s"] | 0.0f;
+        usage.session_reset_mins = doc["sr"] | -1;
+        usage.weekly_pct = doc["w"] | 0.0f;
+        usage.weekly_reset_mins = doc["wr"] | -1;
+        strlcpy(usage.status, doc["st"] | "unknown", sizeof(usage.status));
+        usage.ok = doc["ok"] | false;
+        usage.valid = true;
+
+        int g_before = usage_rate_group();
+        usage_rate_sample(usage.session_pct);
+        int g_after = usage_rate_group();
+        if (g_after != g_before) {
+            Serial.printf("usage rate: group %d -> %d (s=%.2f%%)\n",
+                g_before, g_after, usage.session_pct);
+            if (splash_is_active()) splash_pick_for_current_rate();
+        }
+        ui_update(&usage);
+        ok_any = true;
+    }
+
+    // ---- Calibration trigger ----
+    if (doc["calibrate"].is<bool>() && doc["calibrate"].as<bool>()) {
+        ui_show_calibration();
+        Serial.println("Calibration started");
+        ok_any = true;
+    }
+
+    // ---- Permission prompt ----
+    if (doc["prompt"].is<JsonObjectConst>()) {
+        JsonObjectConst p = doc["prompt"];
+        const char* id = p["id"] | "";
+        const char* tool = p["tool"] | "";
+        const char* hint = p["hint"] | "";
+        ui_set_prompt(id, tool, hint);
+        Serial.printf("Prompt set: tool=%s id=%s\n", tool, id);
+        ok_any = true;
+    } else if (doc.containsKey("prompt")) {
+        // explicit null / non-object → clear
+        ui_clear_prompt();
+        Serial.println("Prompt cleared");
+        ok_any = true;
+    }
+
+    return ok_any;
 }
 
 // ---- Serial command buffer ----
@@ -147,6 +192,7 @@ static void check_serial_cmd() {
         if (c == '\n' || c == '\r') {
             cmd_buf[cmd_pos] = '\0';
             if (strcmp(cmd_buf, "screenshot") == 0) send_screenshot();
+            else if (strcmp(cmd_buf, "calibrate") == 0) ui_show_calibration();
             cmd_pos = 0;
         } else if (cmd_pos < CMD_BUF_SIZE - 1) {
             cmd_buf[cmd_pos++] = c;
@@ -232,16 +278,22 @@ void loop() {
     // press. Activity bookkeeping happens inside idle_consume_wake_press
     // so no separate idle_note_activity() call is needed here.
     {
+        // On the permission screen the side buttons answer the prompt instead
+        // of sending HID Space / Shift+Tab. Decision fires on the press edge;
+        // release does nothing because nothing was "held" over BLE HID.
+        const bool on_perm = (ui_get_current_screen() == SCREEN_PERMISSION);
+
         static bool primary_was = false;
         static bool primary_wake_swallowed = false;
         bool primary_now = input_hal_is_held(INPUT_BTN_PRIMARY);
         if (primary_now != primary_was) {
             if (primary_now) {
-                if (idle_consume_wake_press()) primary_wake_swallowed = true;
-                else                            ble_keyboard_press(0x2C, 0);  // HID Space, no mods
+                if (idle_consume_wake_press())      primary_wake_swallowed = true;
+                else if (on_perm)                   ui_permission_decide("allow");
+                else                                ble_keyboard_press(0x2C, 0);  // HID Space, no mods
             } else {
-                if (primary_wake_swallowed) primary_wake_swallowed = false;
-                else                        ble_keyboard_release();
+                if (primary_wake_swallowed)         primary_wake_swallowed = false;
+                else if (!on_perm)                  ble_keyboard_release();
             }
             primary_was = primary_now;
         }
@@ -252,11 +304,12 @@ void loop() {
             bool secondary_now = input_hal_is_held(INPUT_BTN_SECONDARY);
             if (secondary_now != secondary_was) {
                 if (secondary_now) {
-                    if (idle_consume_wake_press()) secondary_wake_swallowed = true;
+                    if (idle_consume_wake_press())  secondary_wake_swallowed = true;
+                    else if (on_perm)               ui_permission_decide("deny");
                     else                            ble_keyboard_press(0x2B, 0x02);  // HID Tab + LEFT_SHIFT
                 } else {
-                    if (secondary_wake_swallowed) secondary_wake_swallowed = false;
-                    else                          ble_keyboard_release();
+                    if (secondary_wake_swallowed)   secondary_wake_swallowed = false;
+                    else if (!on_perm)              ble_keyboard_release();
                 }
                 secondary_was = secondary_now;
             }
@@ -289,20 +342,8 @@ void loop() {
     check_serial_cmd();
 
     if (ble_has_data()) {
-        if (parse_json(ble_get_data(), &usage)) {
-            int g_before = usage_rate_group();
-            usage_rate_sample(usage.session_pct);
-            int g_after = usage_rate_group();
-            if (g_after != g_before) {
-                Serial.printf("usage rate: group %d -> %d (s=%.2f%%)\n",
-                    g_before, g_after, usage.session_pct);
-                if (splash_is_active()) splash_pick_for_current_rate();
-            }
-            ui_update(&usage);
-            ble_send_ack();
-        } else {
-            ble_send_nack();
-        }
+        if (handle_incoming(ble_get_data())) ble_send_ack();
+        else                                  ble_send_nack();
     }
 
     delay(5);

@@ -10,3 +10,10 @@ struct UsageData {
     bool ok;                 // data parse succeeded
     bool valid;              // false until first successful parse
 };
+
+struct PromptData {
+    char id[40];
+    char tool[24];
+    char hint[200];
+    bool active;
+};
