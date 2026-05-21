@@ -4,6 +4,7 @@
 #include "logo.h"
 #include "icons.h"
 #include "hal/board_caps.h"
+#include "hal/audio_hal.h"
 
 // Custom fonts (scaled for 314 PPI, ~1.9x from original 165 PPI)
 LV_FONT_DECLARE(font_tiempos_56);
@@ -140,6 +141,25 @@ static screen_t current_screen = SCREEN_USAGE;
 // ---- Permission state ----
 static PromptData prompt_state = {};
 static screen_t screen_before_prompt = SCREEN_USAGE;
+
+// ---- Settings (volatile — reset to defaults on boot; NVS persistence is
+//      a follow-up). The toggles actually gate behaviour, they aren't
+//      decorative.
+static bool settings_permissions_enabled = true;
+static bool settings_sound_enabled       = true;
+static bool settings_pace_enabled        = true;
+static int  settings_volume_pct          = 70;
+
+// Last UsageData we rendered, kept so display-affecting toggles can
+// re-render instantly instead of waiting for the next 60 s BLE poll.
+static UsageData last_usage = {};
+
+// ---- Settings screen widgets ----
+static lv_obj_t* settings_container;
+static lv_obj_t* sw_permissions;
+static lv_obj_t* sw_sound;
+static lv_obj_t* sw_pace;
+static lv_obj_t* slider_volume;
 
 // Animation state
 static uint32_t anim_last_ms = 0;
@@ -579,6 +599,140 @@ static void init_calibration_screen(lv_obj_t* scr) {
     lv_obj_add_flag(cal_container, LV_OBJ_FLAG_HIDDEN);
 }
 
+// ======== Settings Screen ========
+
+static void settings_volume_cb(lv_event_t* e) {
+    int v = lv_slider_get_value((lv_obj_t*)lv_event_get_target(e));
+    settings_volume_pct = v;
+    audio_hal_set_volume(v);
+}
+
+static void settings_volume_release_cb(lv_event_t* e) {
+    (void)e;
+    // Audible preview on release — quick way to check the new level.
+    audio_hal_chime();
+}
+
+static void settings_perm_cb(lv_event_t* e) {
+    settings_permissions_enabled = lv_obj_has_state((lv_obj_t*)lv_event_get_target(e),
+                                                    LV_STATE_CHECKED);
+}
+static void settings_sound_cb(lv_event_t* e) {
+    settings_sound_enabled = lv_obj_has_state((lv_obj_t*)lv_event_get_target(e),
+                                              LV_STATE_CHECKED);
+}
+static void settings_pace_cb(lv_event_t* e) {
+    settings_pace_enabled = lv_obj_has_state((lv_obj_t*)lv_event_get_target(e),
+                                             LV_STATE_CHECKED);
+    // Re-render against the cached payload so the weekly label flips
+    // immediately instead of waiting for the daemon's next 60 s poll.
+    if (last_usage.valid) ui_update(&last_usage);
+}
+
+static void settings_test_chime_cb(lv_event_t* e) {
+    (void)e;
+    audio_hal_chime();
+}
+
+static void settings_calibrate_cb(lv_event_t* e) {
+    (void)e;
+    ui_show_calibration();
+}
+
+// Single labelled toggle row: "Label" on the left, switch on the right.
+static lv_obj_t* make_toggle_row(lv_obj_t* parent, int y, const char* label,
+                                 bool initial, lv_event_cb_t cb) {
+    lv_obj_t* lbl = lv_label_create(parent);
+    lv_label_set_text(lbl, label);
+    lv_obj_set_style_text_font(lbl, &font_styrene_28, 0);
+    lv_obj_set_style_text_color(lbl, COL_TEXT, 0);
+    lv_obj_set_pos(lbl, L.margin, y);
+
+    lv_obj_t* sw = lv_switch_create(parent);
+    lv_obj_set_size(sw, 70, 36);
+    lv_obj_set_pos(sw, L.scr_w - L.margin - 70, y);
+    if (initial) lv_obj_add_state(sw, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(sw, cb, LV_EVENT_VALUE_CHANGED, NULL);
+    return sw;
+}
+
+static lv_obj_t* make_action_button(lv_obj_t* parent, const char* text,
+                                    int x, int y, int w, int h, lv_event_cb_t cb) {
+    lv_obj_t* btn = lv_obj_create(parent);
+    lv_obj_set_pos(btn, x, y);
+    lv_obj_set_size(btn, w, h);
+    lv_obj_set_style_bg_color(btn, COL_PANEL, 0);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(btn, 10, 0);
+    lv_obj_set_style_border_width(btn, 0, 0);
+    lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* lbl = lv_label_create(btn);
+    lv_label_set_text(lbl, text);
+    lv_obj_set_style_text_font(lbl, &font_styrene_28, 0);
+    lv_obj_set_style_text_color(lbl, COL_TEXT, 0);
+    lv_obj_center(lbl);
+    return btn;
+}
+
+static void init_settings_screen(lv_obj_t* scr) {
+    settings_container = lv_obj_create(scr);
+    lv_obj_set_size(settings_container, L.scr_w, L.scr_h);
+    lv_obj_set_pos(settings_container, 0, 0);
+    lv_obj_set_style_bg_opa(settings_container, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(settings_container, 0, 0);
+    lv_obj_set_style_pad_all(settings_container, 0, 0);
+    lv_obj_clear_flag(settings_container, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* title = lv_label_create(settings_container);
+    lv_label_set_text(title, "Settings");
+    lv_obj_set_style_text_font(title, &font_tiempos_56, 0);
+    lv_obj_set_style_text_color(title, COL_TEXT, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 16, L.title_y);
+
+    // Volume — "Volume N%" label + slider row.
+    int y = L.content_y;
+    lv_obj_t* vol_lbl = lv_label_create(settings_container);
+    lv_label_set_text(vol_lbl, "Volume");
+    lv_obj_set_style_text_font(vol_lbl, &font_styrene_28, 0);
+    lv_obj_set_style_text_color(vol_lbl, COL_TEXT, 0);
+    lv_obj_set_pos(vol_lbl, L.margin, y);
+    slider_volume = lv_slider_create(settings_container);
+    lv_obj_set_size(slider_volume, L.content_w, 16);
+    lv_obj_set_pos(slider_volume, L.margin, y + 40);
+    lv_slider_set_range(slider_volume, 0, 100);
+    lv_slider_set_value(slider_volume, settings_volume_pct, LV_ANIM_OFF);
+    lv_obj_add_event_cb(slider_volume, settings_volume_cb,
+                        LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(slider_volume, settings_volume_release_cb,
+                        LV_EVENT_RELEASED, NULL);
+
+    // Toggle rows
+    y += 80;
+    sw_permissions = make_toggle_row(settings_container, y, "Permissions",
+                                     settings_permissions_enabled, settings_perm_cb);
+    y += 50;
+    sw_sound       = make_toggle_row(settings_container, y, "Sound",
+                                     settings_sound_enabled, settings_sound_cb);
+    y += 50;
+    sw_pace        = make_toggle_row(settings_container, y, "Pace",
+                                     settings_pace_enabled, settings_pace_cb);
+
+    // Two action buttons side-by-side at the bottom.
+    int btn_h = 70;
+    int btn_y = L.scr_h - btn_h - L.margin;
+    int gap = 16;
+    int btn_w = (L.content_w - gap) / 2;
+    make_action_button(settings_container, "Test chime",
+                       L.margin, btn_y, btn_w, btn_h, settings_test_chime_cb);
+    make_action_button(settings_container, "Calibrate",
+                       L.margin + btn_w + gap, btn_y, btn_w, btn_h,
+                       settings_calibrate_cb);
+
+    lv_obj_add_flag(settings_container, LV_OBJ_FLAG_HIDDEN);
+}
+
 // ======== Pending-prompt badge ========
 
 static void badge_click_cb(lv_event_t* e) {
@@ -637,6 +791,7 @@ void ui_init(void) {
     init_bluetooth_screen(scr);
     init_permission_screen(scr);
     init_calibration_screen(scr);
+    init_settings_screen(scr);
     splash_init(scr);
 
     if (splash_get_root()) {
@@ -657,6 +812,7 @@ void ui_init(void) {
 
 void ui_update(const UsageData* data) {
     if (!data->valid) return;
+    last_usage = *data;
 
     int s_pct = (int)(data->session_pct + 0.5f);
 
@@ -675,7 +831,7 @@ void ui_update(const UsageData* data) {
 
     char reset_buf[40];
     format_reset_time(data->weekly_reset_mins, reset_buf, sizeof(reset_buf));
-    if (data->weekly_reset_mins > 0) {
+    if (data->weekly_reset_mins > 0 && settings_pace_enabled) {
         // Pace gauge: if you stay <= this %, you're on track to not exceed
         // the weekly quota. days_remaining is ceiling of wr / 1440 so a
         // partial day rounds up (you still own today's slice).
@@ -743,11 +899,13 @@ void ui_show_screen(screen_t screen) {
     lv_obj_add_flag(ble_container, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(perm_container, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(cal_container, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(settings_container, LV_OBJ_FLAG_HIDDEN);
     splash_hide();
 
     switch (screen) {
     case SCREEN_SPLASH:     splash_show(); break;
     case SCREEN_USAGE:      lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_HIDDEN); break;
+    case SCREEN_SETTINGS:   lv_obj_clear_flag(settings_container, LV_OBJ_FLAG_HIDDEN); break;
     case SCREEN_BLUETOOTH:  lv_obj_clear_flag(ble_container, LV_OBJ_FLAG_HIDDEN); break;
     case SCREEN_PERMISSION: lv_obj_clear_flag(perm_container, LV_OBJ_FLAG_HIDDEN); break;
     case SCREEN_CALIBRATE:  lv_obj_clear_flag(cal_container, LV_OBJ_FLAG_HIDDEN); break;
@@ -773,7 +931,8 @@ void ui_show_screen(screen_t screen) {
 void ui_cycle_screen(void) {
     screen_t next;
     switch (current_screen) {
-    case SCREEN_USAGE:     next = SCREEN_BLUETOOTH; break;
+    case SCREEN_USAGE:     next = SCREEN_SETTINGS;  break;
+    case SCREEN_SETTINGS:  next = SCREEN_BLUETOOTH; break;
     case SCREEN_BLUETOOTH: next = SCREEN_USAGE;     break;
     default:               next = SCREEN_USAGE;     break;
     }
@@ -822,6 +981,19 @@ void ui_update_ble_status(ble_state_t state, const char* name, const char* mac) 
 }
 
 void ui_set_prompt(const char* id, const char* tool, const char* hint) {
+    // If the user has flipped Permissions off in Settings, immediately tell
+    // the host we're punting on this one so the daemon doesn't sit on the
+    // 120 s timeout. The hook treats anything that isn't "allow"/"deny" as
+    // "ask", which lets Claude Code's normal prompt fire right away.
+    if (!settings_permissions_enabled) {
+        ble_send_decision(id ? id : "", "ask");
+        return;
+    }
+
+    // Only chime on the leading edge — re-asserting the same prompt (e.g.
+    // daemon reconnects and re-pushes) shouldn't ring again.
+    const bool fresh = !prompt_state.active;
+
     strlcpy(prompt_state.id, id ? id : "", sizeof(prompt_state.id));
     strlcpy(prompt_state.tool, tool ? tool : "", sizeof(prompt_state.tool));
     strlcpy(prompt_state.hint, hint ? hint : "", sizeof(prompt_state.hint));
@@ -833,6 +1005,7 @@ void ui_set_prompt(const char* id, const char* tool, const char* hint) {
     // Remember where the user was so we can return there after the decision.
     if (current_screen != SCREEN_PERMISSION) screen_before_prompt = current_screen;
     apply_badge_visibility();
+    if (fresh && settings_sound_enabled) audio_hal_chime();
 }
 
 void ui_clear_prompt(void) {
