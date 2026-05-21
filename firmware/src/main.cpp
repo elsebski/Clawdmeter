@@ -18,6 +18,7 @@
 #include "hal/input_hal.h"
 #include "hal/power_hal.h"
 #include "hal/imu_hal.h"
+#include "hal/audio_hal.h"
 
 static UsageData usage = {};
 
@@ -220,6 +221,7 @@ void setup() {
     power_hal_init();
     imu_hal_init();
     touch_hal_init();
+    audio_hal_init();
 
     // ---- LVGL ----
     const int W = board_caps().width;

@@ -32,6 +32,20 @@
 // ---- PMU ----
 #define AXP2101_ADDR         0x34
 
+// ---- Audio (ES8311 codec @ 0x18, speaker amp via PA) ----
+// Pinout from Waveshare's official Arduino demo (07_ES8311). The codec is
+// on the same shared I2C bus as touch/PMU/IMU. I2S clocks are shared with
+// the ES7210 mic-array codec (not used by Clawdmeter, but pin reservations
+// stand). DOUT goes to the speaker path on ES8311.
+#define ES8311_ADDR          0x18
+#define AUDIO_MCLK           42    // per Waveshare's 07_ES8311.ino (pin_config.h
+                                   //   has 16 but that's for the mic-array path
+                                   //   and didn't make sound on this kit)
+#define AUDIO_BCLK           9
+#define AUDIO_LRCK           45
+#define AUDIO_DOUT           8     // ESP -> ES8311 (speaker)
+#define AUDIO_PA_EN          46    // speaker amp enable (active HIGH)
+
 // ---- Buttons ----
 #define BTN_BACK_GPIO        0     // BOOT — primary, Space (PTT)
 #define BTN_FWD_GPIO         18    // secondary, Shift+Tab (mode toggle)
