@@ -24,11 +24,22 @@ from bleak.exc import BleakError
 DEVICE_NAME = "Claude Controller"
 SERVICE_UUID = "4c41555a-4465-7669-6365-000000000001"
 RX_CHAR_UUID = "4c41555a-4465-7669-6365-000000000002"
+TX_CHAR_UUID = "4c41555a-4465-7669-6365-000000000003"
 REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
 
 POLL_INTERVAL = 60
 TICK = 5
 SCAN_TIMEOUT = 8.0
+PROMPT_TIMEOUT = 120.0
+
+# Unix-socket bridge for the PreToolUse hook. The hook writes one JSON line
+# {"prompt":{"id","tool","hint"}} and reads back {"decision":...,"id":...}.
+SOCKET_PATH = "/tmp/clawdmeter.sock"
+
+# Module-level bridge state: the currently-active BLE session (or None) and
+# any in-flight permission requests keyed by prompt id.
+_active_session: "Session | None" = None
+_pending: dict[str, asyncio.Future] = {}
 
 # macOS: token lives in Keychain (service "Claude Code-credentials").
 # Linux: token lives in ~/.claude/.credentials.json.
@@ -209,11 +220,28 @@ class Session:
         log("Refresh requested by device")
         self.refresh_requested.set()
 
-    async def setup_refresh_subscription(self) -> None:
+    def _on_tx(self, _char, data: bytearray) -> None:
+        try:
+            obj = json.loads(bytes(data).decode("utf-8", "replace"))
+        except (ValueError, UnicodeDecodeError):
+            return
+        if obj.get("cmd") != "permission":
+            return
+        pid = obj.get("id", "")
+        decision = obj.get("decision")
+        fut = _pending.pop(pid, None)
+        if fut and not fut.done():
+            fut.set_result(decision)
+
+    async def setup_subscriptions(self) -> None:
         try:
             await self.client.start_notify(REQ_CHAR_UUID, self._on_refresh)
         except (BleakError, ValueError) as e:
             log(f"Refresh subscription unavailable: {e}")
+        try:
+            await self.client.start_notify(TX_CHAR_UUID, self._on_tx)
+        except (BleakError, ValueError) as e:
+            log(f"TX subscription unavailable: {e}")
 
     async def write_payload(self, payload: dict) -> bool:
         data = json.dumps(payload, separators=(",", ":")).encode()
@@ -246,8 +274,10 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
         return False
 
     log("Connected")
+    global _active_session
     session = Session(client)
-    await session.setup_refresh_subscription()
+    await session.setup_subscriptions()
+    _active_session = session
 
     last_poll = 0.0
     used_successfully = False
@@ -272,6 +302,12 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
             except asyncio.TimeoutError:
                 pass
     finally:
+        _active_session = None
+        # Fail any pending decisions so socket clients don't hang.
+        for fut in list(_pending.values()):
+            if not fut.done():
+                fut.set_result("disconnected")
+        _pending.clear()
         try:
             await client.disconnect()
         except BleakError:
@@ -279,6 +315,101 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
 
     log("Device disconnected" if not stop_event.is_set() else "Stopping")
     return used_successfully
+
+
+async def _handle_socket_client(reader: asyncio.StreamReader,
+                                writer: asyncio.StreamWriter) -> None:
+    """One round-trip per connection: read a JSON prompt request, push it
+    to the device, await the decision notification, write JSON back."""
+    def _reply(obj: dict) -> None:
+        try:
+            writer.write((json.dumps(obj) + "\n").encode())
+        except Exception:
+            pass
+
+    try:
+        line = await asyncio.wait_for(reader.readline(), timeout=5.0)
+        if not line:
+            return
+        req = json.loads(line.decode("utf-8", "replace"))
+        prompt = req.get("prompt") or {}
+        pid = str(prompt.get("id") or "")
+        if not pid:
+            _reply({"err": "missing prompt.id"})
+            return
+
+        sess = _active_session
+        if sess is None:
+            _reply({"decision": "unavailable", "id": pid})
+            return
+
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        _pending[pid] = fut
+
+        payload = {"prompt": {"id": pid,
+                              "tool": str(prompt.get("tool", "?")),
+                              "hint": str(prompt.get("hint", ""))}}
+        if not await sess.write_payload(payload):
+            _pending.pop(pid, None)
+            _reply({"decision": "write_failed", "id": pid})
+            return
+
+        try:
+            decision = await asyncio.wait_for(fut, timeout=PROMPT_TIMEOUT)
+        except asyncio.TimeoutError:
+            decision = "timeout"
+        finally:
+            _pending.pop(pid, None)
+            # Clear prompt on the device regardless of outcome so the UI
+            # doesn't sit on a stale question.
+            try:
+                if _active_session is sess:
+                    await sess.write_payload({"prompt": None})
+            except Exception:
+                pass
+
+        _reply({"decision": decision, "id": pid})
+    except Exception as e:
+        log(f"Socket client error: {e}")
+        _reply({"err": str(e)})
+    finally:
+        try:
+            await writer.drain()
+        except Exception:
+            pass
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+async def _socket_server(stop_event: asyncio.Event) -> None:
+    try:
+        Path(SOCKET_PATH).unlink(missing_ok=True)
+    except OSError:
+        pass
+    server = await asyncio.start_unix_server(_handle_socket_client, path=SOCKET_PATH)
+    try:
+        os.chmod(SOCKET_PATH, 0o600)
+    except OSError:
+        pass
+    log(f"Prompt socket listening at {SOCKET_PATH}")
+    try:
+        async with server:
+            stop_task = asyncio.create_task(stop_event.wait())
+            serve_task = asyncio.create_task(server.serve_forever())
+            done, pending = await asyncio.wait(
+                {stop_task, serve_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for t in pending:
+                t.cancel()
+    finally:
+        try:
+            Path(SOCKET_PATH).unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 async def main() -> None:
@@ -297,6 +428,8 @@ async def main() -> None:
 
     log("=== Claude Usage Tracker Daemon (BLE, macOS) ===")
     log(f"Poll interval: {POLL_INTERVAL}s")
+
+    sock_task = asyncio.create_task(_socket_server(stop_event))
 
     backoff = 1
     while not stop_event.is_set():
@@ -325,6 +458,12 @@ async def main() -> None:
             backoff = min(backoff * 2, 60)
         else:
             backoff = 1
+
+    sock_task.cancel()
+    try:
+        await sock_task
+    except (asyncio.CancelledError, Exception):
+        pass
 
 
 if __name__ == "__main__":
