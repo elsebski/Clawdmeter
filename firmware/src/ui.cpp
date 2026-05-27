@@ -148,6 +148,7 @@ static screen_t screen_before_prompt = SCREEN_USAGE;
 static bool settings_permissions_enabled = true;
 static bool settings_sound_enabled       = true;
 static bool settings_pace_enabled        = true;
+static bool settings_autoswitch_enabled  = false;  // auto-open prompt screen
 static int  settings_volume_pct          = 70;
 
 // Last UsageData we rendered, kept so display-affecting toggles can
@@ -159,6 +160,7 @@ static lv_obj_t* settings_container;
 static lv_obj_t* sw_permissions;
 static lv_obj_t* sw_sound;
 static lv_obj_t* sw_pace;
+static lv_obj_t* sw_autoswitch;
 static lv_obj_t* slider_volume;
 
 // Animation state
@@ -628,6 +630,10 @@ static void settings_pace_cb(lv_event_t* e) {
     // immediately instead of waiting for the daemon's next 60 s poll.
     if (last_usage.valid) ui_update(&last_usage);
 }
+static void settings_autoswitch_cb(lv_event_t* e) {
+    settings_autoswitch_enabled = lv_obj_has_state((lv_obj_t*)lv_event_get_target(e),
+                                                   LV_STATE_CHECKED);
+}
 
 static void settings_test_chime_cb(lv_event_t* e) {
     (void)e;
@@ -709,15 +715,18 @@ static void init_settings_screen(lv_obj_t* scr) {
                         LV_EVENT_RELEASED, NULL);
 
     // Toggle rows
-    y += 80;
+    y += 72;
     sw_permissions = make_toggle_row(settings_container, y, "Permissions",
                                      settings_permissions_enabled, settings_perm_cb);
-    y += 50;
+    y += 46;
     sw_sound       = make_toggle_row(settings_container, y, "Sound",
                                      settings_sound_enabled, settings_sound_cb);
-    y += 50;
+    y += 46;
     sw_pace        = make_toggle_row(settings_container, y, "Pace",
                                      settings_pace_enabled, settings_pace_cb);
+    y += 46;
+    sw_autoswitch  = make_toggle_row(settings_container, y, "Auto-open",
+                                     settings_autoswitch_enabled, settings_autoswitch_cb);
 
     // Two action buttons side-by-side at the bottom.
     int btn_h = 70;
@@ -1006,6 +1015,12 @@ void ui_set_prompt(const char* id, const char* tool, const char* hint) {
     if (current_screen != SCREEN_PERMISSION) screen_before_prompt = current_screen;
     apply_badge_visibility();
     if (fresh && settings_sound_enabled) audio_hal_chime();
+    // Auto-open jumps straight to the prompt instead of waiting for a tap
+    // on the badge. Only on the leading edge so a re-pushed prompt doesn't
+    // yank the user back if they've navigated away.
+    if (fresh && settings_autoswitch_enabled && current_screen != SCREEN_PERMISSION) {
+        ui_show_screen(SCREEN_PERMISSION);
+    }
 }
 
 void ui_clear_prompt(void) {
